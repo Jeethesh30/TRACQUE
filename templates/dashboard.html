@@ -108,6 +108,17 @@
             </div>
         </div>
 
+        {# NOTIFICATION FOR AT-RISK STUDENTS #}
+        {% if session['role'] == 'student' %}
+            {% for note in notifications %}
+                <div class="alert alert-warning" style="margin-bottom: 16px;">
+                    {{ note.message }}
+                </div>
+            {% endfor %}
+        {% endif %}
+
+
+
         {# ATTENDANCE SNAPSHOT CARDS #}
         <div class="row mb-5">
             <h2 style="color: #666; font-size: 1.5em; margin-bottom: 20px;"><i class="fas fa-chart-pie"></i> Real-Time Snapshot</h2>
@@ -118,32 +129,45 @@
                     <div class="card p-4 text-center text-white bg-info">
                         <i class="fas fa-calendar-alt fa-3x mb-3"></i>
                         <p class="h4">{{ total_days|int }}</p>
-                        <p class="mb-0">Total School Days Recorded</p>
+                        <p class="mb-0">Total Days Recorded</p>
                     </div>
                 </a>
             </div>
-            
-            {# BLUE CARD: Links back to index with the Low Attendance filter applied #}
+
+            {# Streak Tracker: Only show for students #}
+            {% if session['role'] == 'student' %}
+            <div class="col-md-6 mb-3">
+                <a class="clickable-card" style="cursor:default;">
+                    <div class="card p-4 text-center text-white bg-info">
+                        <i class="fas fa-fire fa-3x mb-3"></i>
+                        <p class="h4">{{ streak }}</p>
+                        <p class="mb-0">Day Attendance Streak</p>
+                        {% if streak >= 5 %}
+                            <span style="font-size: 1.2em; color: #fff700;">🔥 Keep it up!</span>
+                        {% elif streak == 0 %}
+                            <span style="font-size: 1.1em; color: #fff;">Start your streak today!</span>
+                        {% endif %}
+                    </div>
+                </a>
+            </div>
+            {% elif session['role'] != 'student' %}
             <div class="col-md-6 mb-3">
                 <a href="{{ url_for('index', filter_trend='low') }}" class="clickable-card" id="not-attended-link">
                     <div class="card p-4 text-center text-white bg-primary">
                         <i class="fas fa-users-slash fa-3x mb-3"></i>
                         <p class="h4" id="missing-attendance-data">
-                            {% set missing_count = 0 %}
-                            {% for student in students %}
-                                {% if student.attendance_percentage == 0.0 and total_days > 0 %}
-                                    {% set missing_count = missing_count + 1 %}
-                                {% endif %}
-                            {% endfor %}
-                            {{ missing_count }}
+                            {{ students_not_attended }}
                         </p>
                         <p class="mb-0">Students Not Yet Attended</p>
                     </div>
                 </a>
             </div>
+            {% endif %}
         </div>
 
-            {# ABSENT STUDENTS SECTION #}
+
+            {# ABSENT STUDENTS SECTION: Only for teachers #}
+            {% if session['role'] != 'student' %}
             <div class="card p-4 mb-5 bg-white">
                 <h2 style="color: #d9534f;"><i class="fas fa-user-slash"></i> Absent Students Today</h2>
                 {% if absent_students and absent_students|length > 0 %}
@@ -158,8 +182,10 @@
                     <p class="text-success">All students have attended today!</p>
                 {% endif %}
             </div>
+            {% endif %}
 
-        {# QUICK ACCESS CARDS FOR ATTENDANCE METHODS #}
+        {# QUICK ACCESS CARDS FOR ATTENDANCE METHODS: Only for teachers #}
+        {% if session['role'] != 'student' %}
         <div class="row mb-5">
             <h2 style="color: #666; font-size: 1.5em; margin-bottom: 20px;"><i class="fas fa-hand-pointer"></i> Quick Access - Attendance Methods</h2>
             
@@ -193,6 +219,7 @@
                 </a>
             </div>
         </div>
+        {% endif %}
 
         {# --- SYSTEM SETUP / ACTIONS CARD --- #}
         <div class="card p-4 mb-5 bg-white" id="section-setup">
@@ -235,6 +262,7 @@
         </div>
 
         {# --- STUDENT ROSTER CARD --- #}
+        {% if session['role'] != 'student' %}
         <div class="card p-4 bg-white" id="section-roster">
             <h2><i class="fas fa-users"></i> Student Roster</h2>
             
@@ -348,7 +376,9 @@
                 </table>
             </div>
         </div>
+        {% endif %}
         
+        {% if session['role'] != 'student' %}
         {# --- WHAT-IF ANALYSIS CARD --- #}
         <div class="card mt-4 p-4 bg-white" id="section-whatif">
             <h2><i class="fas fa-chart-bar"></i> What-If Analysis</h2>
@@ -364,6 +394,7 @@
                 </div>
             </div>
         </div>
+        {% endif %}
     </div>
 {% endblock %}
 

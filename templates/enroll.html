@@ -61,6 +61,7 @@
         <h2>Step 2: Capture 30 Face Images</h2>
         <video id="video" width="640" height="480" autoplay muted playsinline style="border-radius: 10px; max-width: 100%; height: auto;"></video>
         <button id="capture" class="button">Start Face Capture</button>
+            <button id="stop-capture" class="button" style="margin-left:10px;">Stop Face Capture</button>
         <div id="capture-status">
             <p>Images Captured: <span id="count">0</span>/30</p>
             <div id="progress-bar"><div id="progress">0%</div></div>
@@ -115,6 +116,9 @@ document.addEventListener('DOMContentLoaded', () => {
         .then(stream => { video.srcObject = stream; })
         .catch(err => { window.showNotification('Could not access webcam. Please check permissions.', 'error'); });
 
+    let captureInterval = null;
+    let isCapturing = false;
+
     captureButton.addEventListener('click', () => {
         const studentId = document.getElementById('student_id').value.trim();
         const name = document.getElementById('name').value.trim();
@@ -135,8 +139,9 @@ document.addEventListener('DOMContentLoaded', () => {
         let count = 0;
         capturedImages = [];
         
-        const interval = setInterval(() => {
-            if (count < 30) {
+        isCapturing = true;
+        captureInterval = setInterval(() => {
+            if (count < 30 && isCapturing) {
                 context.drawImage(video, 0, 0, 640, 480);
                 capturedImages.push(canvas.toDataURL('image/jpeg', 0.8));
                 count++;
@@ -145,10 +150,25 @@ document.addEventListener('DOMContentLoaded', () => {
                 progressDiv.style.width = `${percentage}%`;
                 progressDiv.textContent = `${percentage}%`;
             } else {
-                clearInterval(interval);
+                clearInterval(captureInterval);
+                isCapturing = false;
                 sendImagesToServer(studentId, name, capturedImages);
             }
         }, 150);
+    });
+
+    document.getElementById('stop-capture').addEventListener('click', () => {
+        if (isCapturing && captureInterval) {
+            clearInterval(captureInterval);
+            isCapturing = false;
+            captureButton.textContent = 'Start Face Capture';
+            captureButton.disabled = false;
+            progressDiv.style.width = '0%';
+            progressDiv.textContent = '0%';
+            countSpan.textContent = '0';
+            // Optionally, add logic to turn off any light blink indicator here
+        }
+    });
     });
 
     function sendImagesToServer(studentId, name, images) {
