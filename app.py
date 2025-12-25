@@ -502,6 +502,12 @@ def index():
     search_query = request.args.get('query', '')
     if 'parent_phone' in df.columns:
         df['parent_phone'] = df['parent_phone'].apply(normalize_phone)
+    notifications = []
+    at_risk_students = df[df['performance_category'] == 'At Risk'] if 'performance_category' in df.columns else pd.DataFrame()
+    for student in at_risk_students.to_dict(orient='records'):
+        message = f"Alert: {student['name']} (ID: {student['student_id']}) is classified as AT RISK. Please contact the College."
+        notifications.append({'student_id': student['student_id'], 'message': message})
+
     if role == 'teacher':
         if search_query:
             df_search = df[
@@ -521,17 +527,47 @@ def index():
             total_days=total_days,
             students_not_attended=students_not_attended,
             absent_students=absent_students,
-            can_edit=True)
+            can_edit=True,
+            notifications=notifications)
     else:
         # Students see only their own record, read-only
         student_row = [s for s in df.to_dict(orient='records') if s.get('student_id') == username]
+
+        # --- Calculate attendance streak for the student ---
+        streak = 0
+        if username and not df.empty:
+            import glob
+            attendance_files = sorted(glob.glob(os.path.join(ATTENDANCE_FOLDER, 'attendance_*.csv')), reverse=True)
+            today = datetime.date.today()
+            expected_date = today
+            for file_path in attendance_files:
+                try:
+                    filename = os.path.basename(file_path)
+                    date_str = filename.replace('attendance_', '').replace('.csv', '')
+                    file_date = datetime.datetime.strptime(date_str, '%Y-%m-%d').date()
+                    # Only count streak if file is for expected consecutive date
+                    if file_date != expected_date:
+                        break
+                    daily_df = pd.read_csv(file_path, dtype={'Student ID': str})
+                    attended_today = username in daily_df['Student ID'].astype(str).str.strip().values
+                    if attended_today:
+                        streak += 1
+                        expected_date -= datetime.timedelta(days=1)
+                    else:
+                        break
+                except Exception:
+                    break
+
+        # Only pass the logged-in student's data to the template
         return render_template('dashboard.html', 
             students=student_row,
             search_query=search_query,
             total_days=total_days,
-            students_not_attended=students_not_attended,
-            absent_students=absent_students,
-            can_edit=False)
+            students_not_attended=0,  # Hide not attended count for students
+            absent_students=[],       # Hide absent list for students
+            can_edit=False,
+            notifications=[note for note in notifications if note['student_id'] == username],
+            streak=streak)
 
 # --- Data Management Routes ---
 @app.route('/upload_data', methods=['POST'], endpoint='upload_data')
@@ -643,14 +679,25 @@ def edit_attendance(student_id):
 
 @app.route('/delete_student/<string:student_id>', methods=['POST'])
 def delete_student(student_id):
+    # --- Step 5: Remove student from users.json ---
+    try:
+        users_json_path = os.path.join(os.path.dirname(__file__), 'users.json')
+        with open(users_json_path, 'r') as f:
+            users = json.load(f)
+        users = [user for user in users if user.get('username') != student_id]
+        with open(users_json_path, 'w') as f:
+            json.dump(users, f, indent=2)
+        app.logger.info(f"Removed student {student_id} from users.json.")
+    except Exception as e:
+        app.logger.warning(f"Could not remove student from users.json: {e}")
     # --- Step 1: Remove student from the main database ---
     df = get_df()
     if not df.empty:
-            # Reset attendance before removing
-            if student_id in df['student_id'].values:
-                df.loc[df['student_id'] == student_id, 'attendance_percentage'] = 0.0
-            df = df[df['student_id'] != student_id]
-            save_df(df)
+        # Reset attendance before removing
+        if student_id in df['student_id'].values:
+            df.loc[df['student_id'] == student_id, 'attendance_percentage'] = 0.0
+        df = df[df['student_id'] != student_id]
+        save_df(df)
     
     # --- Step 2: Remove student's face images ---
     face_files = glob.glob(os.path.join(FACES_FOLDER, f'{student_id}.*.jpg'))
@@ -822,6 +869,8 @@ def recognize():
 
     df = get_df()
     student_info = {row['student_id']: row['name'] for _, row in df.iterrows()}
+    # Only allow marking for the logged-in student
+    session_student_id = session.get('username')
 
     try:
         image_data = request.json['image'].split(',')[1]
@@ -839,19 +888,30 @@ def recognize():
             attendance = {'percentage': 0.0, 'status': ''}
             status = ''
             # Using a confidence threshold of 80
-            if conf < 80:
-                student_id = rev_id_map.get(label_pred)
+            student_id = rev_id_map.get(label_pred)
+            if conf < 80 and student_id == session_student_id:
                 if student_id and student_id in student_info:
                     name = student_info[student_id]
                     attendance = mark_attendance(student_id, name)
                     status = attendance.get('status', '')
-            recognized_faces.append({
-                'name': name,
-                'box': [int(x), int(y), int(w), int(h)],
-                'attendance': float(attendance.get('percentage', 0.0)),
-                'confidence': float(conf),
-                'status': status
-            })
+                recognized_faces.append({
+                    'name': name,
+                    'student_id': student_id,
+                    'box': [int(x), int(y), int(w), int(h)],
+                    'attendance': float(attendance.get('percentage', 0.0)),
+                    'confidence': float(conf),
+                    'status': status
+                })
+            else:
+                # If not the logged-in student, ignore or show as unknown
+                recognized_faces.append({
+                    'name': "Unknown",
+                    'student_id': None,
+                    'box': [int(x), int(y), int(w), int(h)],
+                    'attendance': 0.0,
+                    'confidence': float(conf),
+                    'status': ''
+                })
         return jsonify({'recognized_faces': recognized_faces})
     except Exception as e:
         app.logger.error(f"Error in recognition: {str(e)}")
@@ -866,46 +926,70 @@ def barcode_attendance_page():
     if role == 'student':
         df = df[df['student_id'] == username]
         return render_template('barcode_attendance.html', students=df.to_dict(orient='records'))
-    return render_template('barcode_attendance.html')
+    return render_template('barcode_attendance.html', students=None)
 
 @app.route('/mark_barcode_attendance', methods=['POST'])
 def mark_barcode_attendance():
-    """Mark attendance via barcode scan with robust error handling."""
+    """Step 1: Barcode scan, store pending attendance in session."""
     try:
         data = request.get_json()
         scanned_id = str(data['student_id']).strip()
-        
         df = get_df()
         if df.empty:
             return jsonify({'success': False, 'message': 'Student database is empty.'}), 404
-
         student_row = df[df['student_id'] == scanned_id]
-        
         if student_row.empty:
             return jsonify({'success': False, 'message': f"Student ID '{scanned_id}' not found."}), 404
-        
+        # Store pending attendance in session
+        session['pending_attendance'] = scanned_id
         student_name = student_row.iloc[0]['name']
-        result = mark_attendance(scanned_id, student_name)
+        return jsonify({
+            'success': True,
+            'student': {'id': scanned_id, 'name': student_name},
+            'message': f'Barcode scanned. Please verify fingerprint.'
+        })
+    except Exception as e:
+        app.logger.error(f"Error in barcode attendance: {str(e)}")
+        return jsonify({'success': False, 'message': 'Internal server error'}), 500
+
+@app.route('/verify_fingerprint_attendance', methods=['POST'])
+def verify_fingerprint_attendance():
+    """Step 2: Fingerprint verification for pending barcode attendance."""
+    try:
+        pending_id = session.get('pending_attendance')
+        if not pending_id:
+            return jsonify({'success': False, 'message': 'No pending barcode scan.'}), 400
+        df = get_df()
+        student_row = df[df['student_id'] == pending_id]
+        if student_row.empty:
+            session.pop('pending_attendance', None)
+            return jsonify({'success': False, 'message': 'Student not found.'}), 404
+        student_name = student_row.iloc[0]['name']
+        # Here, add fingerprint verification logic (pseudo):
+        # if not verify_fingerprint(pending_id):
+        #     return jsonify({'success': False, 'message': 'Fingerprint verification failed.'}), 403
+        # For now, assume verification is successful
+        result = mark_attendance(pending_id, student_name)
+        session.pop('pending_attendance', None)
         if result['status'] == 'already_present':
             return jsonify({
                 'success': False,
-                'student': {'id': scanned_id, 'name': student_name},
+                'student': {'id': pending_id, 'name': student_name},
                 'timestamp': datetime.datetime.now().strftime("%H:%M:%S"),
                 'message': f'Attendance already marked for {student_name}'
             }), 200
         elif result['status'] == 'marked':
             return jsonify({
                 'success': True,
-                'student': {'id': scanned_id, 'name': student_name},
+                'student': {'id': pending_id, 'name': student_name},
                 'timestamp': datetime.datetime.now().strftime("%H:%M:%S"),
                 'message': f'Attendance marked for {student_name}'
             })
         else:
             return jsonify({'success': False, 'message': 'Unknown error'}), 500
     except Exception as e:
-        app.logger.error(f"Error in barcode attendance: {str(e)}")
+        app.logger.error(f"Error in fingerprint verification: {str(e)}")
         return jsonify({'success': False, 'message': 'Internal server error'}), 500
-
 # --- Fingerprint Attendance Routes ---
 @app.route('/fingerprint_attendance')
 def fingerprint_attendance_page():
@@ -916,7 +1000,7 @@ def fingerprint_attendance_page():
     if role == 'student':
         df = df[df['student_id'] == username]
         return render_template('fingerprint_attendance.html', students=df.to_dict(orient='records'), fingerprint_connected=fingerprint_connected)
-    return render_template('fingerprint_attendance.html', fingerprint_connected=fingerprint_connected)
+    return render_template('fingerprint_attendance.html', students=None, fingerprint_connected=fingerprint_connected)
 
 @app.route('/fingerprint_status')
 def fingerprint_status():
@@ -1310,20 +1394,58 @@ def get_today_attendance():
 def get_trained_model_and_data(df):
     """Helper function to train the model required for analysis and intervention."""
     feature_cols = ['attendance_percentage', 'test_score_1', 'test_score_2', 'assignment_score']
-    
-    # Ensure columns are numeric for calculation
+
+    # CLEANING: Normalize attendance values that may be stored as strings
+    # Examples supported: '75%', '2/2', '2/2 days', '100.0', numeric
+    if 'attendance' in df.columns and df['attendance'].dtype == object:
+        # Try to compute attendance_percentage from an "X/Y" style column if present
+        try:
+            attend_parsed = df['attendance'].astype(str).str.extract(r"(\d+)\s*/\s*(\d+)")
+            if attend_parsed.notnull().all(axis=1).any():
+                numer = pd.to_numeric(attend_parsed[0], errors='coerce')
+                denom = pd.to_numeric(attend_parsed[1], errors='coerce')
+                pct = (numer / denom) * 100
+                # Only set where we could parse both numbers
+                df.loc[pct.notnull(), 'attendance_percentage'] = pct.loc[pct.notnull()]
+        except Exception:
+            pass
+
+    # If attendance_percentage contains '%' or other text, strip non-numeric chars
+    if 'attendance_percentage' in df.columns:
+        try:
+            if df['attendance_percentage'].dtype == object:
+                cleaned = df['attendance_percentage'].astype(str).str.replace('%', '', regex=False)
+                cleaned = cleaned.str.extract(r'([0-9]+\.?[0-9]*)')[0]
+                df['attendance_percentage'] = pd.to_numeric(cleaned, errors='coerce')
+            else:
+                df['attendance_percentage'] = pd.to_numeric(df['attendance_percentage'], errors='coerce')
+        except Exception:
+            df['attendance_percentage'] = pd.to_numeric(df.get('attendance_percentage', pd.Series(dtype=float)), errors='coerce')
+
+    # Ensure all feature columns and target are numeric
     for col in feature_cols + ['final_exam_score']:
-        df[col] = pd.to_numeric(df[col], errors='coerce')
-    
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        else:
+            # If a feature is missing, create it as NaN so dropna works consistently
+            df[col] = np.nan
+
     train_df = df.dropna(subset=feature_cols + ['final_exam_score'])
-    
+
     if len(train_df) < 2:
         return None, None, "Not enough complete student records (with final scores) to train a prediction model."
-    
-    # Use Decision Tree for better non-linear prediction in this context
-    model = DecisionTreeRegressor(random_state=42)
+
+    # Use LinearRegression for stable predictions
+    from sklearn.linear_model import LinearRegression
+    n_train = len(train_df)
+    model = LinearRegression()
+
+    # Debug: show basic training stats
+    print(f"[DEBUG] Training model ({model.__class__.__name__}) on {n_train} samples")
+    print(train_df[feature_cols + ['final_exam_score']])
+
     model.fit(train_df[feature_cols], train_df['final_exam_score'])
-    
+
     return model, feature_cols, None
 
 def send_parent_notification(student):
@@ -1331,7 +1453,7 @@ def send_parent_notification(student):
     if not parent_phone:
         return
     # Placeholder notification (print to server log)
-    message_body = f"Alert: Your child {student['name']} (ID: {student['student_id']}) is classified as AT RISK. Please contact the school."
+    message_body = f"Alert: Your child {student['name']} (ID: {student['student_id']}) is classified as AT RISK. Please contact the College."
     print(f"Notification (placeholder) to {parent_phone}: {message_body}")
 
 @app.route('/analyze_performance', methods=['POST'], endpoint='analyze_performance_route')
@@ -1344,23 +1466,40 @@ def analyze_performance_route():
         return redirect(url_for('index'))
     
     model_choice = request.form.get('model_choice', 'DecisionTreeRegressor')
-    # Re-train with user choice if needed (defaulting to DT here for consistency)
+    # Use the selected model for prediction
     if model_choice == 'LinearRegression':
         model = LinearRegression()
         model.fit(df.dropna(subset=feature_cols + ['final_exam_score'])[feature_cols], df.dropna(subset=feature_cols + ['final_exam_score'])['final_exam_score'])
+    elif model_choice == 'DecisionTreeRegressor':
+        model = DecisionTreeRegressor(random_state=42)
+        model.fit(df.dropna(subset=feature_cols + ['final_exam_score'])[feature_cols], df.dropna(subset=feature_cols + ['final_exam_score'])['final_exam_score'])
 
-    to_predict_mask = df['final_exam_score'].isnull() & df[feature_cols].notnull().all(axis=1)
-    if to_predict_mask.any():
-        predicted_scores = model.predict(df.loc[to_predict_mask, feature_cols])
-        df.loc[to_predict_mask, 'final_exam_score'] = np.clip(predicted_scores, 0, 100)
+    # Debug: Print training data
+    print("\n[DEBUG] Training data for model:")
+    print(df.dropna(subset=feature_cols + ['final_exam_score'])[[*feature_cols, 'final_exam_score']])
+    print("[DEBUG] Features used for prediction:", feature_cols)
+
+    predict_mask = df[feature_cols].notnull().all(axis=1)
+    if predict_mask.any():
+        print("[DEBUG] Data used for prediction:")
+        print(df.loc[predict_mask, feature_cols])
+        predicted_scores = model.predict(df.loc[predict_mask, feature_cols])
+        print("[DEBUG] Predicted scores:", predicted_scores)
+        df.loc[predict_mask, 'final_exam_score'] = np.clip(predicted_scores, 0, 100)
     
-    def categorize(score):
-        if pd.isna(score): return "N/A"
-        if score < 50: return "At Risk"
-        if score < 70: return "Average"
-        if score < 85: return "Good"
+    def categorize(row):
+        if pd.isna(row['final_exam_score']):
+            return "N/A"
+        if row['attendance_percentage'] < 50:
+            return "At Risk"
+        if row['final_exam_score'] < 50:
+            return "At Risk"
+        if row['final_exam_score'] < 70:
+            return "Average"
+        if row['final_exam_score'] < 85:
+            return "Good"
         return "Excellent"
-    df['performance_category'] = df['final_exam_score'].apply(categorize)
+    df['performance_category'] = df.apply(categorize, axis=1)
     save_df(df)
     
     flash(f"Performance analysis complete using {model_choice} model.", "success")
